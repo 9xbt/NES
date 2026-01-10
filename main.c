@@ -18,6 +18,15 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
+#include <string.h>
+#include <time.h>
+#include <stdint.h>
+
+/* X11/Xlib */
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <X11/keysym.h>
 
 /* NES specific */
 #include <nes.h>
@@ -38,39 +47,264 @@ void die (const char * format, ...)
     exit (1);
 }
 
-#include <SDL2/SDL.h>
-
 #define FPS 60
 #define FPS_UPDATE_TIME_MS (1000/FPS)
+#define SCREEN_WIDTH 256
+#define SCREEN_HEIGHT 240
+#define SCALE 2
 
-/* Query a button's state.
-   Returns 1 if button #b is pressed. */
+/* NES controller key indices */
+typedef enum {
+    KEY_A = 0,
+    KEY_S,
+    KEY_C,
+    KEY_RETURN,
+    KEY_UP,
+    KEY_DOWN,
+    KEY_LEFT,
+    KEY_RIGHT,
+    KEY_COUNT
+} nes_key_index_t;
+
+/* X11 Context */
+typedef struct {
+    Display *display;
+    Window window;
+    GC gc;
+    XImage *ximage;
+    int screen;
+    Visual *visual;
+    int depth;
+    uint8_t keys[KEY_COUNT];
+    int running;
+    uint32_t *scaled_buffer;
+} x11_context_t;
+
+/* Get current time in milliseconds */
+static uint32_t get_time_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+}
+
+/* Map KeySym to our key index */
+static int keysym_to_index(KeySym keysym)
+{
+    switch (keysym)
+    {
+        case XK_a:      return KEY_A;
+        case XK_s:      return KEY_S;
+        case XK_c:      return KEY_C;
+        case XK_Return: return KEY_RETURN;
+        case XK_Up:     return KEY_UP;
+        case XK_Down:   return KEY_DOWN;
+        case XK_Left:   return KEY_LEFT;
+        case XK_Right:  return KEY_RIGHT;
+        default:        return -1;
+    }
+}
+
+/* Initialize X11 */
+static void x11_init(x11_context_t *ctx)
+{
+    memset(ctx, 0, sizeof(x11_context_t));
+    ctx->running = 1;
+
+    ctx->display = XOpenDisplay(NULL);
+    if (!ctx->display)
+    {
+        die("Failed to open X display\n");
+    }
+
+    ctx->screen = DefaultScreen(ctx->display);
+    ctx->visual = DefaultVisual(ctx->display, ctx->screen);
+    ctx->depth = DefaultDepth(ctx->display, ctx->screen);
+
+    /* Allocate scaled buffer */
+    ctx->scaled_buffer = malloc(SCREEN_WIDTH * SCALE * SCREEN_HEIGHT * SCALE * sizeof(uint32_t));
+    if (!ctx->scaled_buffer)
+    {
+        die("Failed to allocate scaled buffer\n");
+    }
+
+    /* Create window */
+    ctx->window = XCreateSimpleWindow(
+        ctx->display,
+        RootWindow(ctx->display, ctx->screen),
+        0, 0,
+        SCREEN_WIDTH * SCALE, SCREEN_HEIGHT * SCALE,
+        0,
+        BlackPixel(ctx->display, ctx->screen),
+        BlackPixel(ctx->display, ctx->screen)
+    );
+
+    /* Set window properties */
+    XStoreName(ctx->display, ctx->window, "nes_emu");
+    
+    /* Set WM_DELETE_WINDOW protocol for proper window closing */
+    Atom wm_delete_window = XInternAtom(ctx->display, "WM_DELETE_WINDOW", False);
+    XSetWMProtocols(ctx->display, ctx->window, &wm_delete_window, 1);
+
+    /* Select input events */
+    XSelectInput(ctx->display, ctx->window, 
+                 KeyPressMask | KeyReleaseMask | ExposureMask | StructureNotifyMask);
+
+    /* Create graphics context */
+    ctx->gc = XCreateGC(ctx->display, ctx->window, 0, NULL);
+
+    /* Create XImage for rendering at scaled size */
+    ctx->ximage = XCreateImage(
+        ctx->display,
+        ctx->visual,
+        ctx->depth,
+        ZPixmap,
+        0,
+        (char *)ctx->scaled_buffer,  /* Use scaled buffer */
+        SCREEN_WIDTH * SCALE,        /* Scaled width */
+        SCREEN_HEIGHT * SCALE,       /* Scaled height */
+        32,
+        0
+    );
+
+    if (!ctx->ximage)
+    {
+        die("Failed to create XImage\n");
+    }
+
+    /* Map window and wait for it to be mapped */
+    XMapWindow(ctx->display, ctx->window);
+    XFlush(ctx->display);
+}
+
+/* Process X11 events */
+static void x11_process_events(x11_context_t *ctx)
+{
+    XEvent event;
+    
+    while (XPending(ctx->display))
+    {
+        XNextEvent(ctx->display, &event);
+        
+        switch (event.type)
+        {
+            case KeyPress: 
+            {
+                KeySym keysym = XLookupKeysym(&event.xkey, 0);
+                int idx = keysym_to_index(keysym);
+                if (idx >= 0)
+                    ctx->keys[idx] = 1;
+                break;
+            }
+            case KeyRelease:
+            {
+                KeySym keysym = XLookupKeysym(&event.xkey, 0);
+                int idx = keysym_to_index(keysym);
+                if (idx >= 0)
+                    ctx->keys[idx] = 0;
+                break;
+            }
+            case ClientMessage:
+            {
+                /* Handle window close button */
+                Atom wm_delete_window = XInternAtom(ctx->display, "WM_DELETE_WINDOW", False);
+                if ((Atom)event.xclient.data.l[0] == wm_delete_window)
+                {
+                    ctx->running = 0;
+                }
+                break;
+            }
+            case DestroyNotify:
+                ctx->running = 0;
+                break;
+        }
+    }
+}
+
+/* Render frame to X11 window with scaling */
+static void x11_render(x11_context_t *ctx, uint32_t *framebuffer)
+{
+    /* Nearest-neighbor upscaling */
+    for (int y = 0; y < SCREEN_HEIGHT; y++)
+    {
+        for (int x = 0; x < SCREEN_WIDTH; x++)
+        {
+            uint32_t pixel = framebuffer[y * SCREEN_WIDTH + x];
+            
+            /* Write scaled pixel block */
+            for (int sy = 0; sy < SCALE; sy++)
+            {
+                for (int sx = 0; sx < SCALE; sx++)
+                {
+                    int dest_x = x * SCALE + sx;
+                    int dest_y = y * SCALE + sy;
+                    ctx->scaled_buffer[dest_y * (SCREEN_WIDTH * SCALE) + dest_x] = pixel;
+                }
+            }
+        }
+    }
+    
+    /* Draw scaled image to window */
+    XPutImage(
+        ctx->display,
+        ctx->window,
+        ctx->gc,
+        ctx->ximage,
+        0, 0,                          /* source x, y */
+        0, 0,                          /* dest x, y */
+        SCREEN_WIDTH * SCALE,          /* scaled width */
+        SCREEN_HEIGHT * SCALE          /* scaled height */
+    );
+    
+    XFlush(ctx->display);
+}
+
+/* Cleanup X11 */
+static void x11_cleanup(x11_context_t *ctx)
+{
+    if (ctx->ximage)
+    {
+        ctx->ximage->data = NULL;  /* Don't let XDestroyImage free our buffer */
+        XDestroyImage(ctx->ximage);
+    }
+    if (ctx->scaled_buffer)
+        free(ctx->scaled_buffer);
+    if (ctx->gc)
+        XFreeGC(ctx->display, ctx->gc);
+    if (ctx->window)
+        XDestroyWindow(ctx->display, ctx->window);
+    if (ctx->display)
+        XCloseDisplay(ctx->display);
+}
+
+/* NES controller input - mapped to X11 keyboard */
+static x11_context_t *g_x11_ctx = NULL;
+
 uint8_t nes_key_state(uint8_t b)
 {
-    const Uint8* keyboard;
-    SDL_PumpEvents();
-    keyboard = SDL_GetKeyboardState(NULL);
-
+    if (!g_x11_ctx)
+        return 0;
+    
     switch (b)
     {
         case 0: // On / Off
             return 1;
         case 1: // A
-            return keyboard[SDL_SCANCODE_A] ? 1 : 0;
+            return g_x11_ctx->keys[KEY_A];
         case 2: // B
-            return keyboard[SDL_SCANCODE_S] ? 1 : 0;
+            return g_x11_ctx->keys[KEY_S];
         case 3: // SELECT
-            return keyboard[SDL_SCANCODE_C] ? 1 : 0;
+            return g_x11_ctx->keys[KEY_C];
         case 4: // START
-            return keyboard[SDL_SCANCODE_RETURN] ? 1 : 0;
+            return g_x11_ctx->keys[KEY_RETURN];
         case 5: // UP
-            return keyboard[SDL_SCANCODE_UP] ? 1 : 0;
+            return g_x11_ctx->keys[KEY_UP];
         case 6: // DOWN
-            return keyboard[SDL_SCANCODE_DOWN] ? 1 : 0;
+            return g_x11_ctx->keys[KEY_DOWN];
         case 7: // LEFT
-            return keyboard[SDL_SCANCODE_LEFT] ? 1 : 0;
+            return g_x11_ctx->keys[KEY_LEFT];
         case 8: // RIGHT
-            return keyboard[SDL_SCANCODE_RIGHT] ? 1 : 0;
+            return g_x11_ctx->keys[KEY_RIGHT];
         default:
             return 1;
     }
@@ -138,47 +372,17 @@ int main(int argc, char *argv[])
     /* init ppu */
     nes_ppu_init(&nes_ppu, &nes_memory);
 
+    /* X11 Initialization */
+    static x11_context_t x11_ctx;
+    x11_init(&x11_ctx);
+    g_x11_ctx = &x11_ctx;
 
-
-    /* SDL2 Initialization */
     unsigned int lastTime = 0, currentTime;
 
-    if (SDL_Init(SDL_INIT_EVERYTHING) != 0)
+    while (x11_ctx.running)
     {
-        die("Failed to initialise SDL\n");
-    }
-
-    SDL_Window *window = SDL_CreateWindow("nes_emu",
-                                          SDL_WINDOWPOS_UNDEFINED,
-                                          SDL_WINDOWPOS_UNDEFINED,
-                                          256*5,
-                                          240*5,
-                                          SDL_WINDOW_OPENGL);
-    if (window == NULL)
-    {
-        die("Could not create a window: %s", SDL_GetError());
-    }
-
-    SDL_Renderer *renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
-    if (renderer == NULL)
-    {
-        die("Could not create a renderer: %s", SDL_GetError());
-    }
-
-    SDL_Texture * texture = SDL_CreateTexture(renderer,
-            SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STATIC, 256, 240);
-
-    while (1)
-    {
-        // Get the next event
-        SDL_Event event;
-        if (SDL_PollEvent(&event))
-        {
-            if (event.type == SDL_QUIT)
-            {
-                break;
-            }
-        }
+        /* Process X11 events */
+        x11_process_events(&x11_ctx);
 
         /* NES core loop */
         for(;;)
@@ -209,49 +413,16 @@ int main(int argc, char *argv[])
             if(ppu_status & PPU_STATUS_FRAME_READY) break;
         }
 
-        /* Commented DEBUG code */
-        // for(int i=0x0000;i<0x0FFF;i++)
-        // {
-        //     printf("Pattern Table 0: %x %x\n", i, (uint8_t)ppu_memory_access(&nes_memory, i, 0, ACCESS_READ_BYTE));
-        // }
-        // for(int i=0x1000;i<0x1FFF;i++)
-        // {
-        //     printf("Pattern Table 1: %x %x\n", i, (uint8_t)ppu_memory_access(&nes_memory, i, 0, ACCESS_READ_BYTE));
-        // }
-        // /* Nametable 0 contents */
-        // for(int i=0x2000;i<0x23FF;i++)
-        // {
-        //     printf("Nametable 0: %x %x\n", i, (uint8_t)ppu_memory_access(&nes_memory, i, 0, ACCESS_READ_BYTE));
-        // }
-        // /* Nametable 1 contents */
-        // for(int i=0x2400;i<0x27FF;i++)
-        // {
-        //     printf("Nametable 1: %x %x\n", i, (uint8_t)ppu_memory_access(&nes_memory, i, 0, ACCESS_READ_BYTE));
-        // }
-        // for(int i=0x3F00;i<=0x3F1F;i++)
-        // {
-        //     printf("PALLETE: %x %x\n", i, ppu_memory_access(&nes_memory, i, 0, ACCESS_READ_BYTE));
-        // }
-        // for(int i=0;i<256;i++)
-        // {
-        //     printf("OAM: %d %x\n", i, nes_memory.oam_memory[i]);
-        // }
-
-        SDL_UpdateTexture(texture, NULL, nes_ppu.screen_bitmap, 256 * sizeof(Uint32));
-
-        SDL_RenderClear(renderer);
-        SDL_RenderCopy(renderer, texture, NULL, NULL);
+        /* Render frame */
+        x11_render(&x11_ctx, (uint32_t *)nes_ppu.screen_bitmap);
 
         /* 60 FPS framerate limit */
-        while ((currentTime = SDL_GetTicks()) < (lastTime + FPS_UPDATE_TIME_MS));
+        while ((currentTime = get_time_ms()) < (lastTime + FPS_UPDATE_TIME_MS));
         lastTime = currentTime;
-        SDL_RenderPresent(renderer);
     }
 
-    // Tidy up
-    SDL_DestroyRenderer(renderer);
-    SDL_DestroyWindow(window);
-    SDL_Quit();
+    /* Cleanup */
+    x11_cleanup(&x11_ctx);
 
     return 0;
 }
